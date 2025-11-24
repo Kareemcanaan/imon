@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-version="V2.98"
+version="V3.0-ipv6-pyroute2"
 
 import argparse
 import datetime
@@ -16,6 +16,15 @@ import syslog
 import threading
 import time
 
+# New imports for IPv6 and pyroute2 support
+try:
+    from pyroute2 import IPRoute
+    PYROUTE2_AVAILABLE = True
+except ImportError:
+    PYROUTE2_AVAILABLE = False
+    print("Warning: pyroute2 not available, falling back to shell commands")
+    print("Install with: pip install pyroute2")
+
 def perrorexit(emsg):
     """
     Print the message and exit the program
@@ -28,6 +37,109 @@ def dosystem(docmd):
     Returns the result from subprocess.run, which contains: returncode, stdout, and stderr (text)
     """
     return subprocess.run(docmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
+
+class RouteManager:
+    """
+    Manages routing operations using pyroute2 when available, falls back to shell commands
+    Supports both IPv4 and IPv6
+    """
+    def __init__(self):
+        self.use_pyroute2 = PYROUTE2_AVAILABLE
+        self.ipr = IPRoute() if self.use_pyroute2 else None
+    
+    def __del__(self):
+        if self.ipr:
+            self.ipr.close()
+    
+    def get_interface_ip(self, ifname, ipv6=False):
+        """Get IP address for interface, supports both IPv4 and IPv6"""
+        if self.use_pyroute2:
+            try:
+                idx = self.ipr.link_lookup(ifname=ifname)[0]
+                family = 10 if ipv6 else 2  # AF_INET6 = 10, AF_INET = 2
+                addrs = self.ipr.get_addr(index=idx, family=family)
+                if addrs:
+                    for addr in addrs:
+                        for attr in addr['attrs']:
+                            if attr[0] == 'IFA_ADDRESS':
+                                return attr[1]
+                return ""
+            except Exception as e:
+                return ""
+        else:
+            # Fallback to shell command
+            family_flag = "inet6" if ipv6 else "inet"
+            r = dosystem(f"ip -o -br -f {family_flag} addr show {ifname}")
+            ipline = r.stdout.strip()
+            if ipline:
+                parts = ' '.join(ipline.split()).split()
+                if len(parts) >= 3:
+                    return parts[2].split("/")[0]
+            return ""
+    
+    def route_exists(self, gateway, ipaddr, ipv6=False):
+        """Check if a default route exists"""
+        if self.use_pyroute2:
+            try:
+                family = 10 if ipv6 else 2
+                routes = self.ipr.get_routes(family=family, dst='default')
+                for route in routes:
+                    gw = None
+                    prefsrc = None
+                    for attr in route['attrs']:
+                        if attr[0] == 'RTA_GATEWAY':
+                            gw = attr[1]
+                        if attr[0] == 'RTA_PREFSRC':
+                            prefsrc = attr[1]
+                    if gw == gateway and prefsrc == ipaddr:
+                        return True
+                return False
+            except Exception:
+                return False
+        else:
+            # Fallback to shell command
+            r = dosystem(f"ip route list src {ipaddr} default")
+            return r.stdout.strip() != ""
+    
+    def add_route(self, gateway, interface, ipaddr, metric, ipv6=False):
+        """Add a default route"""
+        if self.use_pyroute2:
+            try:
+                idx = self.ipr.link_lookup(ifname=interface)[0]
+                family = 10 if ipv6 else 2
+                dst = '::/0' if ipv6 else '0.0.0.0/0'
+                self.ipr.route('add', 
+                              dst=dst,
+                              gateway=gateway,
+                              oif=idx,
+                              prefsrc=ipaddr,
+                              priority=metric,
+                              family=family)
+                return True
+            except Exception as e:
+                return False
+        else:
+            # Fallback to shell command
+            r = dosystem(f"ip route add default via {gateway} dev {interface} src {ipaddr} metric {metric}")
+            return r.returncode == 0
+    
+    def delete_route(self, gateway, ipv6=False):
+        """Delete a default route"""
+        if self.use_pyroute2:
+            try:
+                family = 10 if ipv6 else 2
+                dst = '::/0' if ipv6 else '0.0.0.0/0'
+                self.ipr.route('del',
+                              dst=dst,
+                              gateway=gateway,
+                              family=family)
+                return True
+            except Exception:
+                return False
+        else:
+            # Fallback to shell command
+            r = dosystem(f"ip route delete default via {gateway}")
+            return r.returncode == 0
 
 def callaction(pd, cmd, aargs):
     if pd.db['global']['action'] != "":
@@ -124,11 +236,20 @@ class _failoverMonitor(threading.Thread):
         self.notfirst = False
         self.timer = self.interval = self.pd.db['failover']['interval']
         tnow = datetime.datetime.now()
+        
+        # Initialize RouteManager for both IPv4 and IPv6
+        self.route_mgr = RouteManager()
+        
+        # Check if IPv6 is enabled in config
+        self.ipv6_enabled = self.pd.db['failover'].get('ipv6-enabled', False)
+        
         self.primaryx = {'if':self.pd.db['failover']['primary-if'], \
                          'ename':"Primary", \
                          'name':self.pd.db['failover']['primary-name'], \
                          'ip':"", \
+                         'ip6':"", \
                          'gw':self.pd.db['failover']['primary-gw'], \
+                         'gw6':self.pd.db['failover'].get('primary-gw6', ''), \
                          'ping':self.pd.db['failover']['primary-ping'], \
                          'postping':self.pd.db['failover']['primary-postping'], \
                          'state':False,
@@ -140,7 +261,9 @@ class _failoverMonitor(threading.Thread):
                          'ename':"Standby", \
                          'name':self.pd.db['failover']['standby-name'], \
                          'ip':"", \
+                         'ip6':"", \
                          'gw':self.pd.db['failover']['standby-gw'], \
+                         'gw6':self.pd.db['failover'].get('standby-gw6', ''), \
                          'ping':self.pd.db['failover']['standby-ping'], \
                          'postping':self.pd.db['failover']['standby-postping'], \
                          'state':False,
@@ -156,13 +279,9 @@ class _failoverMonitor(threading.Thread):
     def _logit(self, msg):
         logit(self.pd, msg, mname="failover")
 
-    def _getipaddr(self, devname):
-        r = dosystem("ip -o -br -f inet addr show {}".format(devname))
-        ipline = r.stdout.strip()
-        # line looks like: eth0             UP             192.168.92.220/24
-        # grab the IP address and strip the mask
-        return ' '.join(ipline.split()).split()[2].split("/")[0] if ipline != "" else ""
-        return ipaddr
+    def _getipaddr(self, devname, ipv6=False):
+        """Get IP address using RouteManager (supports both IPv4 and IPv6)"""
+        return self.route_mgr.get_interface_ip(devname, ipv6=ipv6)
 
     def _isonline(self, ifdat, iping):
         try:
@@ -181,18 +300,30 @@ class _failoverMonitor(threading.Thread):
                 olstatus = "offline"
             callaction(self.pd, "failover-postping", "{} {}".format(self._packifinfo(ifdat), olstatus))
 
-    def _getroute(self, ipaddr):
-        r = dosystem("ip route list src {} default".format(ipaddr))
-        return r.stdout.strip()
-
-    def _route_add(self, ifdat):
-        if self._getroute(ifdat['ip']) == "": 
-            r = dosystem("ip route add {}".format("default via {} dev {} src {} metric {}".format(ifdat['gw'], ifdat['if'], ifdat['ip'], self.pd.db['failover']['metric'])))
+    def _route_add(self, ifdat, ipv6=False):
+        """Add route using RouteManager"""
+        gw = ifdat['gw6'] if ipv6 else ifdat['gw']
+        ip = ifdat['ip6'] if ipv6 else ifdat['ip']
+        
+        if not self.route_mgr.route_exists(gw, ip, ipv6=ipv6):
+            success = self.route_mgr.add_route(gw, ifdat['if'], ip, 
+                                              self.pd.db['failover']['metric'], 
+                                              ipv6=ipv6)
+            if success:
+                proto = "IPv6" if ipv6 else "IPv4"
+                self._logit(f"Added {proto} route via {gw}")
         return
 
-    def _route_delete(self, ifdat):
-        if self._getroute(ifdat['ip']) != "":
-            r = dosystem("ip route delete default via {}".format(ifdat['gw']))
+    def _route_delete(self, ifdat, ipv6=False):
+        """Delete route using RouteManager"""
+        gw = ifdat['gw6'] if ipv6 else ifdat['gw']
+        ip = ifdat['ip6'] if ipv6 else ifdat['ip']
+        
+        if self.route_mgr.route_exists(gw, ip, ipv6=ipv6):
+            success = self.route_mgr.delete_route(gw, ipv6=ipv6)
+            if success:
+                proto = "IPv6" if ipv6 else "IPv4"
+                self._logit(f"Deleted {proto} route via {gw}")
         return
 
     def _dofailover(self, ito, ifrom):
@@ -201,8 +332,16 @@ class _failoverMonitor(threading.Thread):
         ito['on'] = True
         ifrom['on'] = False
         self._logit("Network Failover to {} Network {}".format(ito['ename'], ito['devnam']))
-        self._route_delete(ifrom)
-        self._route_add(ito)
+        
+        # Handle IPv4 routes
+        self._route_delete(ifrom, ipv6=False)
+        self._route_add(ito, ipv6=False)
+        
+        # Handle IPv6 routes if enabled
+        if self.ipv6_enabled and ito['gw6'] and ifrom['gw6']:
+            self._route_delete(ifrom, ipv6=True)
+            self._route_add(ito, ipv6=True)
+        
         self._logit("Network Failover {} Route {} is active".format(ito['ename'], ito['devnam']))
         act = "failover-primary" if ito == self.primaryx else "failover-standby"
         callaction(self.pd, act, self._packifinfo(ito))
@@ -229,7 +368,9 @@ class _failoverMonitor(threading.Thread):
             for px in [self.primaryx, self.standbyx]:
                 if self._isonline(px, px['ping'] if px['ping'] != "" else px['gw']):
                     if not px['state']:
-                        px['ip'] = self._getipaddr(px['if'])
+                        px['ip'] = self._getipaddr(px['if'], ipv6=False)
+                        if self.ipv6_enabled:
+                            px['ip6'] = self._getipaddr(px['if'], ipv6=True)
                         if self.notfirst:
                             self._logit("{} Network {} is now online".format(px['ename'], px['devnam']))
                             self._logit("{} Network Outage Duration: {}".format(px['ename'], langdatediff(datetime.datetime.now() - px['timedown'])))

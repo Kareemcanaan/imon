@@ -3,7 +3,7 @@
 
 [ $EUID -eq 0 ] && sudo="" || sudo="sudo"
 
-srcurl="https://raw.githubusercontent.com/gitbls/imon/main"
+srcurl="https://raw.githubusercontent.com/Kareemcanaan/imon/main"
 #FOR-TESTING srcurl="file:///l/work/imon"
 echo "> Copy imon from $srcurl"
 for f in imon imon-configure imon-action.sample
@@ -20,9 +20,13 @@ then
 fi
 echo "> Create python3 venv: /root/.imon-venv"
 $sudo python3 -m venv /root/.imon-venv
-echo "> pip3 Install icmplib and requests into venv: /root/.imon-venv"
-$sudo /root/.imon-venv/bin/pip3 install icmplib requests
+echo "> pip3 Install icmplib, requests, and pyroute2 into venv: /root/.imon-venv"
+$sudo /root/.imon-venv/bin/pip3 install icmplib requests pyroute2
 echo $"
 > Use imon-configure to configure imon, then enable the service
-  See https://github.com/gitbls/imon for complete details
+  See https://github.com/Kareemcanaan/imon for complete details
+  
+  New in v3.0:
+  - IPv6 dual-stack support
+  - pyroute2 integration for better performance
 "
