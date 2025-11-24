@@ -1,0 +1,28 @@
+#!/bin/bash
+
+
+[ $EUID -eq 0 ] && sudo="" || sudo="sudo"
+
+srcurl="https://raw.githubusercontent.com/gitbls/imon/main"
+#FOR-TESTING srcurl="file:///l/work/imon"
+echo "> Copy imon from $srcurl"
+for f in imon imon-configure imon-action.sample
+do
+    $sudo curl -L $srcurl/$f -o /usr/local/bin/$f
+    $sudo chmod 755 /usr/local/bin/$f
+done
+$sudo curl -L $srcurl/imon@.service -o /etc/systemd/system/imon@.service
+
+if [ "$(which pip3)" == "" ]
+then
+    echo "> Install python3-pip"
+    $sudo apt install python3-pip --yes --no-install-recommends
+fi
+echo "> Create python3 venv: /root/.imon-venv"
+$sudo python3 -m venv /root/.imon-venv
+echo "> pip3 Install icmplib and requests into venv: /root/.imon-venv"
+$sudo /root/.imon-venv/bin/pip3 install icmplib requests
+echo $"
+> Use imon-configure to configure imon, then enable the service
+  See https://github.com/gitbls/imon for complete details
+"
